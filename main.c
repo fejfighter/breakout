@@ -7,7 +7,7 @@
 #include <unistd.h>
 #include <libgen.h>
 #include <pty.h>
-
+#include <ctype.h>
 
 #include <systemd/sd-bus.h>
 #define _cleanup_(f) __attribute__((cleanup(f)))
@@ -32,15 +32,74 @@ int signal_end(sd_bus_message *m,
 		   sd_bus_error *ret_error) {
     uint32_t pid, retval;
 
-    printf("handle signal %d\n\n\n", *(uint8_t*)(userdata));
-    *(uint8_t*)(userdata) = 0;
-    //printf("return %s", ret_error->name);
-    
     sd_bus_message_read(m, "uu", &pid, &retval);
-    printf("returned %u %u\n", pid, retval);
-    //exit(0);
+    sd_event_exit((sd_event*)userdata, retval);
+
     return retval;
 }
+
+static struct termios orig;
+
+void reset_stdin(void) {
+    tcsetattr(STDIN_FILENO, TCSANOW, &orig);
+}
+
+#include <endian.h>
+#include <errno.h>
+
+int send_out(sd_event_source *s,
+	      int fd,
+	      uint32_t revents,
+	      void *userdata) {
+    char c = 'a';
+    ssize_t n =1;
+    int master = *(int*)(userdata);
+
+
+    n = read(STDIN_FILENO, &c, 1);
+    if (n < 0) {
+	if (errno == EAGAIN)
+	    return 0;
+	return -errno;
+    }
+    /* if (iscntrl(c)) { */
+    /*   printf("%d\n", c); */
+    /* } else { */
+    /*   printf("%d ('%c')\n", c, c); } */
+
+
+    write(master, &c, n);
+    fsync(master);
+    return 0;
+}
+
+int write_out(sd_event_source *s,
+	      int fd,
+	      uint32_t revents,
+	      void *userdata) {
+
+    void *buffer;
+    ssize_t n;
+    int sz;
+
+    /* UDP enforces a somewhat reasonable maximum datagram size of 64K, we can just allocate the buffer on the stack */
+    if (ioctl(fd, FIONREAD, &sz) < 0)
+	return -2;
+    buffer = alloca(sz);
+
+    n = read(fd, buffer, sz);
+    if (n < 0) {
+	if (errno == EAGAIN)
+	    return 0;
+
+	return -errno;
+    }
+
+    fwrite(buffer, 1, n, stdout);
+    fflush(stdout);
+    return 0;
+}
+
 
 static int log_error(int error, const char *message) {
     //errno = -error;
@@ -52,7 +111,7 @@ int main(int argc, char **argv) {
 
     bool symlink = false;
     char* arg0 = basename(argv[0]);
-    
+
     //printf("%s, == %s\n", ARGV_0, arg0);
    if (strncmp(ARGV_0, arg0, strlen(arg0))) {
 	symlink = true;
@@ -60,6 +119,7 @@ int main(int argc, char **argv) {
     else if(argc == 1)
     {
 	printf(" Nothing listed\n");
+	return -1;
     }
 
   sd_bus *system = NULL;
@@ -67,34 +127,40 @@ int main(int argc, char **argv) {
   sd_bus_message* reply = NULL;
   sd_bus_message* call = NULL;
   int con_err = 0;
-  
+  sd_event *ev = NULL;
+
   con_err = sd_bus_default_user(&system);
   if (con_err < 0)
   {
     printf("Failed connection %d\n", con_err);
   }
 
-  uint8_t loop = 1;
+
+
+  sd_event_new(&ev);
+  sd_bus_attach_event(system, ev, 0);
+
   int build_err= 0;
-  
+
   build_err = sd_bus_match_signal(system, NULL,
 				  DESTINATION,
 				  PATH,
 				  INTERFACE,
 				  SIGNAL,
-				  signal_end, &loop);
+				  signal_end,
+				  ev);
   if(build_err < 0) {
     printf("err: %s %s\n", "not", INTERFACE);
 
   }
-  printf("sleep: %d\n", loop);
+
 
   char cwd[100];
   getcwd(cwd,100);
   uint32_t pid = 0;
   uint32_t flags = 0;
-  
-  
+
+
   build_err = sd_bus_message_new_method_call(system, &call,
 					     DESTINATION,
 					     PATH,
@@ -104,13 +170,13 @@ int main(int argc, char **argv) {
     return log_error(build_err, "couldn't constrcut call");
 
   if(build_err < 0)
-        printf("0010error1 %d: %p\n", build_err, call);
+	printf("0010error1 %d: %p\n", build_err, call);
 
   build_err = sd_bus_message_append_array(call, 'y', cwd, sizeof(cwd));
   if(build_err < 0)
-        printf("001error1 %d: %p\n", build_err, call);
+	printf("001error1 %d: %p\n", build_err, call);
   sd_bus_message_close_container(call);
-  
+
   build_err = 0;
   sd_bus_message_open_container(call, 'a', "ay");
 
@@ -118,7 +184,7 @@ int main(int argc, char **argv) {
   {
       build_err = sd_bus_message_append_array(call, 'y', arg0, strlen(arg0)+1);
       //printf("%d -%s-%ld-\n", 0, arg0, strlen(arg0)+1);
-   
+
   }
   for ( int i = 1; i < argc; i++)
   {
@@ -129,30 +195,38 @@ int main(int argc, char **argv) {
   }
   sd_bus_message_close_container(call);
 
-  
+
   build_err = sd_bus_message_open_container(call, 'a', "{uh}");
   if(build_err < 0)
     printf("004a error1 %d\n", build_err);
 
 
-  // Temporarily redirect stdout to the slave, so that the command executed in
-  // the subprocess will write to the slave.
-  /* int _stdout = dup(STDOUT_FILENO); */
-  /* dup2(slave, STDOUT_FILENO); */
-  
-  //build_err = openpty(&master, &slave, NULL, NULL, NULL);
-  //if(build_err != 0)
-  //  printf("005errorptr %d\n", build_err);
-  
+  int32_t master, slave;
+  struct termios term;
+  tcgetattr(STDIN_FILENO, &term);
+  tcgetattr(STDIN_FILENO, &orig);
+  cfmakeraw(&term);
+  tcsetattr(STDIN_FILENO, TCSANOW, &term);
+  atexit(reset_stdin);
+  build_err = openpty(&master, &slave, NULL, NULL, NULL);
+  if(build_err != 0)
+   printf("005errorptr %d\n", build_err);
 
-  build_err = sd_bus_message_append(call, "{uh}", STDIN_FILENO, STDIN_FILENO);
-  build_err = sd_bus_message_append(call, "{uh}", STDOUT_FILENO, STDOUT_FILENO);
-  build_err = sd_bus_message_append(call, "{uh}", STDERR_FILENO, STDERR_FILENO);
+
+
+  build_err = sd_bus_message_append(call, "{uh}", STDIN_FILENO, slave);
+  build_err = sd_bus_message_append(call, "{uh}", STDOUT_FILENO, slave);
+  build_err = sd_bus_message_append(call, "{uh}", STDERR_FILENO, slave);
+
+  sd_event_source *ev_src = NULL;
+  sd_event_add_io(ev, &ev_src, master, EPOLLIN|EPOLLRDHUP, write_out, NULL);
+  sd_event_add_io(ev, &ev_src, STDIN_FILENO, EPOLLIN, send_out, &master);
+
   if(build_err < 0)
     printf("005error1 %d\n", build_err);
   sd_bus_message_close_container(call);
 
-  
+
   sd_bus_message_open_container(call, 'a', "{ss}");
   build_err = sd_bus_message_append(call, "{ss}", "DEBUG", "1");
   if(build_err < 0)
@@ -160,11 +234,11 @@ int main(int argc, char **argv) {
   sd_bus_message_close_container(call);
 
   build_err = sd_bus_message_append(call, "u", flags);
-  
+
   if(build_err < 0)
     printf("008error1 %d\n", build_err);
 
-  
+
   build_err = sd_bus_call(system,
 			  call,
 			  0,
@@ -172,80 +246,10 @@ int main(int argc, char **argv) {
 			  &reply);
   if(build_err < 0) {
     printf("err: %s %s\n", err.name , err.message);
-
     return log_error(build_err, "error at call");
   }
-  
+
   sd_bus_message_read(reply, "u", &pid);
 
-  //printf("reply: %u\n", pid);
-//  sd_bus_slot *slot = NULL;
-  /* fd_set rfds; */
-  /* struct timeval tv ={0, 0}; */
-  /* char buf[4097]; */
-  /* ssize_t size; */
-  /* size_t count = 0; */
-
-  while (loop)
-  {
-
-      
-   build_err = sd_bus_process(system, NULL);
-
-   if (build_err < 0) {
-       log_error(build_err, "Failed to process requests: %m");
-       return -1;
-   }
-   /* FD_ZERO(&rfds); */
-   /*  FD_SET(master, &rfds); */
-   /*  if (select(master + 1, &rfds, NULL, NULL, &tv)) { */
-   /*    size = read(master, buf, 4096); */
-   /*    buf[size] = '\0'; */
-   /*    count += size; */
-   /*  } */
-
-   
-   if (build_err == 0) {
-       build_err = sd_bus_wait(system, UINT64_MAX);
-       if (build_err < 0) {
-	   log_error(build_err, "Failed to wait: %m");
-
-       }
-       continue;
-   }
-  }
-  // Read from master as we wait for the child process to exit.
-  //
-  // We don't wait for it to exit and then read at once, because otherwise the
-  // command being executed could potentially saturate the slave's buffer and
-  // stall.
-  /* while (1) { */
-  /*     //if (waitpid(pid, NULL, WNOHANG) == pid) { */
-  /*     if (! loop) { */
-  /*     break; */
-  /*   } */
-  /* } */
-
-  // Child process terminated; we flush the output and restore stdout.
-  fsync(STDOUT_FILENO);
-  /* dup2(_stdout, STDOUT_FILENO); */
-
-  /* // Read until there's nothing to read, by which time we must have read */
-  /* // everything because the child is long gone. */
-  /* while (1) { */
-  /*   FD_ZERO(&rfds); */
-  /*   FD_SET(master, &rfds); */
-  /*   if (!select(master + 1, &rfds, NULL, NULL, &tv)) { */
-  /*     // No more to read. */
-  /*     break; */
-  /*   } */
-  /*   size = read(master, buf, 4096); */
-  /*   buf[size] = '\0'; */
-  /*   count += size; */
-  /* } */
-
-  // Close both ends of the pty.
-    
-  sd_bus_unref(system);
-  return 0;
+  return   sd_event_loop(ev);
 }
