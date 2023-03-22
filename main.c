@@ -183,6 +183,8 @@ int main(int argc, char **argv) {
   if (symlink)
   {
       build_err = sd_bus_message_append_array(call, 'y', arg0, strlen(arg0)+1);
+      if(build_err < 0)
+	printf("001error1 %d: %p\n", build_err, call);
       //printf("%d -%s-%ld-\n", 0, arg0, strlen(arg0)+1);
 
   }
@@ -215,8 +217,15 @@ int main(int argc, char **argv) {
 
 
   build_err = sd_bus_message_append(call, "{uh}", STDIN_FILENO, slave);
+  if(build_err < 0)
+	printf("001error1 %d: %p\n", build_err, call);
+
   build_err = sd_bus_message_append(call, "{uh}", STDOUT_FILENO, slave);
+  if(build_err < 0)
+      printf("001error1 %d: %p\n", build_err, call);
   build_err = sd_bus_message_append(call, "{uh}", STDERR_FILENO, slave);
+  if(build_err < 0)
+      printf("001error1 %d: %p\n", build_err, call);
 
   sd_event_source *ev_src = NULL;
   sd_event_add_io(ev, &ev_src, master, EPOLLIN|EPOLLRDHUP, write_out, NULL);
